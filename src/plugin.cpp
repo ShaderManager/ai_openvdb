@@ -10,6 +10,33 @@
 #include <unordered_map>
 #include <string>
 
+namespace str
+{
+	std::vector<std::string> split(const std::string& src, const char* delimeters)
+	{
+		std::string::size_type offset = 0;
+		std::vector<std::string> result;
+
+		do
+		{
+			const auto new_offset = src.find_first_of(delimeters, offset);
+
+			if (new_offset != std::string::npos)
+			{
+				result.push_back(std::move(src.substr(offset, new_offset - offset)));
+				offset = new_offset + 1;
+				continue;
+			}
+
+			result.push_back(std::move(src.substr(offset)));
+			offset = new_offset;
+
+		} while (offset != std::string::npos);
+
+		return result;
+	}
+}
+
 struct AtStringKeyHasher
 {
 	size_t operator ()(const AtString& key) const
@@ -220,13 +247,16 @@ bool plugin_cleanup(void* user_ptr)
 	return true;
 }
 
+#include <windows.h>
+
 volume_plugin_loader
 {
+	MessageBox(0, "!", "!", MB_OK);
+
 	strcpy(vtable->version, AI_VERSION);
 	vtable->Init = plugin_init;
 	vtable->Cleanup = plugin_cleanup;
 	vtable->CreateVolume = volume_init;
-	vtable->UpdateVolume = volume_update;
 	//vtable->UpdateVolume = volume_update;
 	vtable->CleanupVolume = volume_finish;
 	vtable->Sample = volume_sample;
