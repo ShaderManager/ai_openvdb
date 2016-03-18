@@ -9,4 +9,4 @@ set(sources plugin.cpp)
 
 add_library(ai_openvdb SHARED ${sources})
 
-target_link_libraries(ai_openvdb ${ARNOLD_LIBRARIES} ${OPENVDB_LIBRARIES})
+target_link_libraries(ai_openvdb ${ARNOLD_LIBRARIES} ${OPENVDB_LIBRARIES} ${TBB_LIBRARIES} ${ILMBASE_HALF_LIBRARY})
