@@ -50,6 +50,18 @@ struct AtStringKeyHasher
 	}
 };
 
+enum class GridType : int
+{
+	Unknown,
+	Float,
+};
+
+struct Grid
+{
+	GridType type = GridType::Unknown;
+	int32_t offset = -1;
+};
+
 struct Volume
 {
 	Volume()
@@ -62,7 +74,10 @@ struct Volume
 		delete intersector;
 	}
 
-	std::unordered_map<AtString, openvdb::GridBase::Ptr, AtStringKeyHasher, AtStringKeyHasher> grids;
+	std::unordered_map<AtString, Grid, AtStringKeyHasher, AtStringKeyHasher> grids;
+
+	std::vector<openvdb::FloatGrid::ConstPtr> float_grids;
+
 	openvdb::FloatGrid::ConstPtr density_grid;
 	openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid>* intersector = nullptr;
 	openvdb::math::CoordBBox total_bbox;
@@ -80,15 +95,30 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 
 		openvdb::BBoxd total_bbox;
 
-		for (auto name_it = file.beginName(); name_it != file.endName(); ++name_it)
+		std::vector<std::string> grids_to_read
 		{
-			auto grid = file.readGrid(name_it.gridName());
+			"Temperature",
+			"VelocitiesX",
+			"VelocitiesY",
+			"VelocitiesZ"
+		};
 
-			new_volume->grids[AtString(name_it.gridName().c_str())] = grid;
+		auto grid_reader = [&](const std::string& grid_name)
+		{
+			auto grid = file.readGrid(grid_name);
 
-			if (grid->isType<openvdb::FloatGrid>() && !new_volume->density_grid)
+			const AtString name(grid_name.c_str());
+
+			if (grid->isType<openvdb::FloatGrid>())
 			{
-				new_volume->density_grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid);				
+				new_volume->grids[name].type = GridType::Float;
+				new_volume->grids[name].offset = new_volume->float_grids.size();
+				new_volume->float_grids.push_back(openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid));				
+
+				if (!new_volume->density_grid)
+				{
+					new_volume->density_grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid);
+				}
 			}
 
 			AiAddMemUsage(grid->memUsage(), "OpenVDB");
@@ -97,6 +127,27 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 
 			new_volume->total_bbox.expand(grid_bbox);
 			total_bbox.expand(grid->transform().indexToWorld(grid_bbox));
+		};
+
+		if (!grids_to_read.empty())
+		{
+			for (auto& grid_name : grids_to_read)
+			{
+				if (!file.hasGrid(grid_name))
+				{
+					AiMsgWarning("'%s' doesn't have grid with name '%s'", data, grid_name.c_str());
+					continue;
+				}
+
+				grid_reader(grid_name);
+			}
+		}
+		else
+		{
+			for (auto name_it = file.beginName(); name_it != file.endName(); ++name_it)
+			{
+				grid_reader(name_it.gridName());
+			}
 		}
 
 		if (new_volume->density_grid)
@@ -143,35 +194,28 @@ bool volume_finish(void* user_ptr, AtVolumeData* volume, const AtNode* node)
 	return false;
 }
 
-template<typename Result, typename GridType> Result sample_grid(int interpolation, const typename GridType::ConstAccessor& accessor, 
+template<typename Result, typename GridType> Result sample_grid(int interpolation, const typename GridType::ConstUnsafeAccessor& accessor,
 	const openvdb::math::Transform& transform, const openvdb::Vec3d sampling_point)
 {
+	using namespace openvdb::tools;
+
+	const auto index_point = transform.worldToIndex(sampling_point);
+	Result result = openvdb::zeroVal<Result>();
+
 	switch (interpolation)
 	{
 	case AI_VOLUME_INTERP_CLOSEST:
-	{
-		openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::PointSampler> sampler(accessor, transform);
-
-		return sampler.wsSample(sampling_point);
-	}
-	break;
+		PointSampler::sample(accessor, index_point, result);
+		break;
 	case AI_VOLUME_INTERP_TRILINEAR:
-	{
-		openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler> sampler(accessor, transform);
-
-		return sampler.wsSample(sampling_point);
-	}
-	break;
+		BoxSampler::sample(accessor, index_point, result);
+		break;
 	case AI_VOLUME_INTERP_TRICUBIC:
-	{
-		openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::QuadraticSampler> sampler(accessor, transform);
+		QuadraticSampler::sample(accessor, index_point, result);
+		break;		
+	}
 
-		return sampler.wsSample(sampling_point);
-	}
-	break;
-	default:
-		return Result();
-	}
+	return result;
 }
 
 bool volume_sample(void* user_ptr, const AtVolumeData* volume, const AtString channel, 
@@ -192,17 +236,21 @@ bool volume_sample(void* user_ptr, const AtVolumeData* volume, const AtString ch
 		return false;
 	}
 
-	auto grid_ptr = grid_it->second;
+	const auto& grid = grid_it->second;
 	const openvdb::Vec3d sampling_point(sg->Po.x, sg->Po.y, sg->Po.z);
 
-	if (grid_ptr->isType<openvdb::FloatGrid>())
+	switch (grid.type)
 	{
-		auto grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid_ptr);
-		auto accessor = grid->getConstAccessor();		
+	case GridType::Float:
+		{
+			const auto& grid_ptr = self->float_grids[grid.offset];
+			auto accessor = grid_ptr->getConstUnsafeAccessor();
 
-		value->FLT = sample_grid<float, openvdb::FloatGrid>(interpolation, accessor, grid->transform(), sampling_point);
+			value->FLT = sample_grid<float, openvdb::FloatGrid>(interpolation, accessor, grid_ptr->transform(), sampling_point);
 
-		*type = AI_TYPE_FLOAT;
+			*type = AI_TYPE_FLOAT;
+		}
+		break;
 	}
 
 	return true;
@@ -247,12 +295,8 @@ bool plugin_cleanup(void* user_ptr)
 	return true;
 }
 
-#include <windows.h>
-
 volume_plugin_loader
 {
-	MessageBox(0, "!", "!", MB_OK);
-
 	strcpy(vtable->version, AI_VERSION);
 	vtable->Init = plugin_init;
 	vtable->Cleanup = plugin_cleanup;
