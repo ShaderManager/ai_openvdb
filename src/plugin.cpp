@@ -6,6 +6,7 @@
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/Interpolation.h>
 #include <openvdb/tools/RayIntersector.h>
+#include <openvdb/tools/ValueTransformer.h>
 
 #include <unordered_map>
 #include <string>
@@ -79,6 +80,8 @@ struct Volume
 	std::vector<openvdb::FloatGrid::ConstPtr> float_grids;
 
 	openvdb::FloatGrid::ConstPtr density_grid;
+	openvdb::Vec3SGrid::Ptr velocity_grid;
+
 	openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid>* intersector = nullptr;
 	openvdb::math::CoordBBox total_bbox;
 };
@@ -97,17 +100,14 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 
 		std::vector<std::string> grids_to_read
 		{
-			"Temperature",
-			"VelocitiesX",
-			"VelocitiesY",
-			"VelocitiesZ"
+			"Temperature"
 		};
 
 		auto grid_reader = [&](const std::string& grid_name)
 		{
 			auto grid = file.readGrid(grid_name);
 
-			const AtString name(grid_name.c_str());
+			const AtString name(grid_name.c_str());			
 
 			if (grid->isType<openvdb::FloatGrid>())
 			{
@@ -147,6 +147,84 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 			for (auto name_it = file.beginName(); name_it != file.endName(); ++name_it)
 			{
 				grid_reader(name_it.gridName());
+			}
+		}
+
+		std::vector<std::string> velocity_grids
+		{
+			"VelocitiesX",
+			"VelocitiesY",
+			"VelocitiesZ"
+		};
+
+		for (auto& grid_name : velocity_grids)
+		{
+			auto find_it = new_volume->grids.find(AtString(grid_name.c_str()));
+			if (file.hasGrid(grid_name) || find_it != new_volume->grids.end())
+			{
+				openvdb::GridBase::Ptr grid;
+
+				if (find_it != new_volume->grids.end())
+				{
+					grid = file.readGrid(grid_name);
+				}
+
+				if (openvdb::Vec3SGrid::gridType() == grid->type())
+				{
+					new_volume->velocity_grid = openvdb::gridPtrCast<openvdb::Vec3SGrid>(grid);
+				}
+				else if (openvdb::FloatGrid::gridType() == grid->type())
+				{
+					if (!new_volume->velocity_grid)
+					{
+						new_volume->velocity_grid = openvdb::Vec3SGrid::create(*grid);
+					}
+
+					auto comp_grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid);
+
+					int comp = 0;
+
+					if (grid_name.back() == 'Y' || grid_name.back() == 'y')
+					{
+						comp = 1;
+					}
+					else if (grid_name.back() == 'Z' || grid_name.back() == 'z')
+					{
+						comp = 2;
+					}
+
+					auto op = [comp]
+					(const openvdb::FloatGrid::ValueOnCIter& it, openvdb::Vec3SGrid::Accessor& accessor)
+					{
+						if (it.isVoxelValue())
+						{ // set a single voxel
+							auto val = accessor.getValue(it.getCoord());
+
+							switch (comp)
+							{
+							case 0:
+								val.x() = it.getValue();
+								break;
+							case 1:
+								val.y() = it.getValue();
+								break;
+							case 2:
+								val.z() = it.getValue();
+								break;
+							}
+
+							accessor.setValue(it.getCoord(), val);
+						}
+						else
+						{ // fill an entire tile
+							openvdb::math::CoordBBox bbox;
+							it.getBoundingBox(bbox);
+							accessor.getTree()->fill(bbox, openvdb::Vec3s(*it));
+						}
+					};
+
+					openvdb::tools::transformValues(comp_grid->cbeginValueOn(), *new_volume->velocity_grid, op);
+				}
 			}
 		}
 
@@ -237,7 +315,21 @@ bool volume_sample(void* user_ptr, const AtVolumeData* volume, const AtString ch
 	}
 
 	const auto& grid = grid_it->second;
-	const openvdb::Vec3d sampling_point(sg->Po.x, sg->Po.y, sg->Po.z);
+	openvdb::Vec3d sampling_point(sg->Po.x, sg->Po.y, sg->Po.z);
+
+	const float shutter_start = AiCameraGetShutterStart();
+	const float shutter_end = AiCameraGetShutterEnd();
+
+	if (shutter_start != shutter_end && self->velocity_grid)
+	{
+		auto accessor = self->velocity_grid->getConstUnsafeAccessor();
+
+		auto velocity = accessor.getValue(self->velocity_grid->transform().worldToIndexCellCentered(sampling_point));
+
+		const float rel_time = (sg->time - shutter_start) / (shutter_end - shutter_start);
+
+		sampling_point = sampling_point - velocity * rel_time * 1000;
+	}
 
 	switch (grid.type)
 	{
@@ -265,6 +357,9 @@ void volume_ray_extents(void* user_ptr, const AtVolumeData* volume, const AtVolu
 		openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid> intersector(*self->intersector);
 		const openvdb::Vec3s ray_origin(origin->x, origin->y, origin->z);
 		decltype(intersector)::RayType ray(ray_origin, openvdb::Vec3s(direction->x, direction->y, direction->z), t0, t1);
+
+		const float shutter_start = AiCameraGetShutterStart();
+		const float shutter_end = AiCameraGetShutterEnd();
 
 		if (intersector.setWorldRay(ray))
 		{
