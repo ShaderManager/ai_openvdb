@@ -84,32 +84,26 @@ template<int comp> void upload_velocity_channel(openvdb::FloatGrid::ConstPtr com
 	{
 		if (it.isVoxelValue()) // set a single voxel
 		{
-			auto val = accessor.getValue(it.getCoord());
-
-			switch (comp)
+			const float value = it.getValue();
+			accessor.modifyValue(it.getCoord(), [value](openvdb::Vec3s& val)
 			{
-			case 0:
-				val.x() = it.getValue();
-				break;
-			case 1:
-				val.y() = it.getValue();
-				break;
-			case 2:
-				val.z() = it.getValue();
-				break;
-			}
-
-			accessor.setValue(it.getCoord(), val);
-		}
-		else // fill an entire tile
-		{
-			openvdb::math::CoordBBox bbox;
-			it.getBoundingBox(bbox);
-			accessor.getTree()->fill(bbox, openvdb::Vec3s(*it));
+				switch (comp)
+				{
+				case 0:
+					val.x() = value;
+					break;
+				case 1:
+					val.y() = value;
+					break;
+				case 2:
+					val.z() = value;
+					break;
+				}
+			});
 		}
 	};
 
-	openvdb::tools::transformValues(comp_grid->cbeginValueOn(), *velocity_grid, op);
+	openvdb::tools::transformValues(comp_grid->cbeginValueOn(), *velocity_grid, op, false);	
 }
 
 bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeData* volume)
@@ -194,8 +188,7 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 
 				if (find_it == new_volume->grids.end())
 				{
-					grid = file.readGrid(grid_name);
-					AiAddMemUsage(grid->memUsage(), memory_category);
+					grid = file.readGrid(grid_name);					
 				}
 				else
 				{
@@ -205,17 +198,19 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 				if (openvdb::Vec3SGrid::gridType() == grid->type())
 				{
 					new_volume->velocity_grid = openvdb::gridConstPtrCast<openvdb::Vec3SGrid>(grid);
+					AiAddMemUsage(grid->memUsage(), memory_category);
 				}
 				else if (openvdb::FloatGrid::gridType() == grid->type())
-				{
+				{	
+					auto comp_grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid);
+
 					if (!new_volume->velocity_grid)
 					{
-						new_volume->converted_velocity_grid = openvdb::Vec3SGrid::create(*grid);
+						new_volume->converted_velocity_grid = openvdb::Vec3SGrid::create(openvdb::zeroVal<openvdb::Vec3s>());
+						new_volume->converted_velocity_grid->setTransform(new_volume->density_grid->transform().copy());
 						new_volume->velocity_grid = openvdb::gridConstPtrCast<openvdb::Vec3SGrid>(new_volume->converted_velocity_grid);
 						AiAddMemUsage(new_volume->converted_velocity_grid->memUsage(), memory_category);
-					}
-
-					auto comp_grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid);
+					}										
 
 					if (grid_name.back() == 'X' || grid_name.back() == 'x')
 					{
@@ -223,7 +218,7 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 					}
 					else if (grid_name.back() == 'Y' || grid_name.back() == 'y')
 					{
-						upload_velocity_channel<1>(comp_grid, new_volume->converted_velocity_grid);
+						upload_velocity_channel<1>(comp_grid, new_volume->converted_velocity_grid);						
 					}
 					else // Z component
 					{
