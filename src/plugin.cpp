@@ -75,12 +75,28 @@ struct Volume
 		delete intersector;
 	}
 
+	openvdb::GridBase::ConstPtr get_grid_ptr(const Grid& grid) const
+	{
+		switch (grid.type)
+		{
+		case GridType::Float:
+			return float_grids[grid.offset];
+		default:
+			return openvdb::GridBase::ConstPtr();
+		}
+	}
+
 	std::unordered_map<AtString, Grid, AtStringKeyHasher, AtStringKeyHasher> grids;
 
 	std::vector<openvdb::FloatGrid::ConstPtr> float_grids;
 
 	openvdb::FloatGrid::ConstPtr density_grid;
-	openvdb::Vec3SGrid::Ptr velocity_grid;
+	openvdb::Vec3SGrid::Ptr source_velocity_grid;
+	openvdb::Vec3SGrid::ConstPtr velocity_grid;
+
+	float velocity_scale;
+	float velocity_shutter_start = -0.25;
+	float velocity_shutter_end = 0.25f;
 
 	openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid>* intersector = nullptr;
 	openvdb::math::CoordBBox total_bbox;
@@ -98,10 +114,7 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 
 		openvdb::BBoxd total_bbox;
 
-		std::vector<std::string> grids_to_read
-		{
-			"Temperature"
-		};
+		std::vector<std::string> grids_to_read;
 
 		auto grid_reader = [&](const std::string& grid_name)
 		{
@@ -120,13 +133,12 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 					new_volume->density_grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid);
 				}
 			}
+			else
+			{
+				return;
+			}
 
-			AiAddMemUsage(grid->memUsage(), "OpenVDB");
-
-			const auto grid_bbox = grid->evalActiveVoxelBoundingBox();
-
-			new_volume->total_bbox.expand(grid_bbox);
-			total_bbox.expand(grid->transform().indexToWorld(grid_bbox));
+			AiAddMemUsage(grid->memUsage(), "OpenVDB");			
 		};
 
 		if (!grids_to_read.empty())
@@ -162,22 +174,27 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 			auto find_it = new_volume->grids.find(AtString(grid_name.c_str()));
 			if (file.hasGrid(grid_name) || find_it != new_volume->grids.end())
 			{
-				openvdb::GridBase::Ptr grid;
+				openvdb::GridBase::ConstPtr grid;
 
-				if (find_it != new_volume->grids.end())
+				if (find_it == new_volume->grids.end())
 				{
 					grid = file.readGrid(grid_name);
+				}
+				else
+				{
+					grid = new_volume->get_grid_ptr(find_it->second);
 				}
 
 				if (openvdb::Vec3SGrid::gridType() == grid->type())
 				{
-					new_volume->velocity_grid = openvdb::gridPtrCast<openvdb::Vec3SGrid>(grid);
+					new_volume->velocity_grid = openvdb::gridConstPtrCast<openvdb::Vec3SGrid>(grid);
 				}
 				else if (openvdb::FloatGrid::gridType() == grid->type())
 				{
 					if (!new_volume->velocity_grid)
 					{
-						new_volume->velocity_grid = openvdb::Vec3SGrid::create(*grid);
+						new_volume->source_velocity_grid = openvdb::Vec3SGrid::create(*grid);
+						new_volume->velocity_grid = openvdb::gridConstPtrCast<openvdb::Vec3SGrid>(new_volume->source_velocity_grid);
 					}
 
 					auto comp_grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid);
@@ -223,7 +240,7 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 						}
 					};
 
-					openvdb::tools::transformValues(comp_grid->cbeginValueOn(), *new_volume->velocity_grid, op);
+					openvdb::tools::transformValues(comp_grid->cbeginValueOn(), *new_volume->source_velocity_grid, op);
 				}
 			}
 		}
@@ -231,9 +248,40 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 		if (new_volume->density_grid)
 		{
 			new_volume->intersector = new openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid>(*new_volume->density_grid, new_volume->total_bbox);
+			volume->auto_step_size = new_volume->density_grid->voxelSize().x();
+		}
+		else
+		{
+			return false;
 		}
 
-		volume->auto_step_size = new_volume->density_grid->voxelSize().x();
+		openvdb::Vec3s min_velocity(0, 0, 0);
+		openvdb::Vec3s max_velocity(0, 0, 0);
+
+		if (new_volume->velocity_grid)
+		{
+			new_volume->velocity_grid->evalMinMax(min_velocity, max_velocity);
+			new_volume->velocity_scale = 1.f; // / 24.f;
+		}
+
+		for (auto& grid_it : new_volume->grids)
+		{
+			openvdb::GridBase::ConstPtr grid = new_volume->get_grid_ptr(grid_it.second);
+
+			if (!grid)
+				continue;
+
+			auto grid_bbox = grid->evalActiveVoxelBoundingBox();
+			
+			auto world_grid_bbox = grid->transform().indexToWorld(grid_bbox);
+
+			world_grid_bbox.expand(max_velocity * new_volume->velocity_scale);
+
+			grid_bbox = grid->transform().worldToIndexNodeCentered(world_grid_bbox);
+			new_volume->total_bbox.expand(grid_bbox);
+
+			total_bbox.expand(world_grid_bbox);
+		}
 
 		volume->bbox.min.x = total_bbox.min().x();
 		volume->bbox.min.y = total_bbox.min().y();
@@ -327,8 +375,9 @@ bool volume_sample(void* user_ptr, const AtVolumeData* volume, const AtString ch
 		auto velocity = accessor.getValue(self->velocity_grid->transform().worldToIndexCellCentered(sampling_point));
 
 		const float rel_time = (sg->time - shutter_start) / (shutter_end - shutter_start);
+		const float vel_time = LERP(rel_time, self->velocity_shutter_start, self->velocity_shutter_end);
 
-		sampling_point = sampling_point - velocity * rel_time * 1000;
+		sampling_point = sampling_point - velocity * vel_time * self->velocity_scale;
 	}
 
 	switch (grid.type)
