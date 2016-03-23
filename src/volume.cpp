@@ -116,15 +116,19 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 
 		file.open(false);
 
-		new_volume->source_filename = data;
+		AiMsgDebug("OpenVDB: opened file '%s'", data);
 
-		openvdb::BBoxd total_bbox;
+		new_volume->source_filename = data;		
 
 		std::vector<std::string> grids_to_read = str::split(read_user_param(node, "grids", ""), " ,");
+
+		const char* density_grid_name = read_user_param<const char*>(node, "density_grid", nullptr);
 
 		auto grid_reader = [&](const std::string& grid_name) -> bool
 		{
 			auto grid = file.readGrid(grid_name);
+
+			AiMsgDebug("OpenVDB: read grid '%s'. Type: '%s'", grid_name.c_str(), grid->type().c_str());
 
 			const AtString name(grid_name.c_str());
 
@@ -134,7 +138,7 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 				new_volume->grids[name].offset = new_volume->float_grids.size();
 				new_volume->float_grids.push_back(openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid));
 
-				if (!new_volume->density_grid)
+				if ((!density_grid_name && !new_volume->density_grid) || (density_grid_name && grid_name == density_grid_name))
 				{
 					new_volume->density_grid = openvdb::gridConstPtrCast<openvdb::FloatGrid>(grid);
 				}
@@ -177,6 +181,12 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 			}
 		}
 
+		if (!new_volume->density_grid)
+		{
+			AiMsgError("OpenVDB: There is no grid with type Float. Plugin can raytrace only through the volume of type float");
+			return false;
+		}
+
 		std::vector<std::string> velocity_grids = str::split(read_user_param(node, "velocity_grids", ""), " ,");;
 
 		for (auto& grid_name : velocity_grids)
@@ -214,40 +224,22 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 
 					if (grid_name.back() == 'X' || grid_name.back() == 'x')
 					{
+						AiMsgDebug("OpenVDB: reading X channel for velocity grid from '%s'", grid_name.c_str());
 						upload_velocity_channel<0>(comp_grid, new_volume->converted_velocity_grid);
 					}
 					else if (grid_name.back() == 'Y' || grid_name.back() == 'y')
 					{
+						AiMsgDebug("OpenVDB: reading Y channel for velocity grid from '%s'", grid_name.c_str());
 						upload_velocity_channel<1>(comp_grid, new_volume->converted_velocity_grid);						
 					}
 					else // Z component
 					{
+						AiMsgDebug("OpenVDB: reading Z channel for velocity grid from '%s'", grid_name.c_str());
 						upload_velocity_channel<2>(comp_grid, new_volume->converted_velocity_grid);
 					}
 				}
 			}
-		}
-
-		if (new_volume->density_grid)
-		{
-			switch (new_volume->density_grid->getGridClass())
-			{
-			case openvdb::GRID_LEVEL_SET:
-				AiMsgError("Ray-marching through the level set is not supported!");
-				return false;
-				break;
-			default:
-				new_volume->volume_intersector = new FogVolumeRayIntersector(*new_volume->density_grid, new_volume->total_bbox);
-				break;
-			}
-
-			volume->auto_step_size = max_comp(new_volume->density_grid->voxelSize());
-		}
-		else
-		{
-			AiMsgError("OpenVDB: There is no grid with type Float. Plugin can raytrace only through the volume of type float");
-			return false;
-		}
+		}		
 
 		openvdb::Vec3s min_velocity(0, 0, 0);
 		openvdb::Vec3s max_velocity(0, 0, 0);
@@ -262,6 +254,8 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 			new_volume->velocity_shutter_end = read_user_param<float>(node, "velocity_shutter_end", 0.f);
 		}
 
+		openvdb::BBoxd total_bbox;
+
 		for (auto& grid_it : new_volume->grids)
 		{
 			openvdb::GridBase::ConstPtr grid = new_volume->get_grid_ptr(grid_it.second);
@@ -270,7 +264,6 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 				continue;
 
 			auto grid_bbox = grid->evalActiveVoxelBoundingBox();
-
 			auto world_grid_bbox = grid->transform().indexToWorld(grid_bbox);
 
 			if (new_volume->velocity_grid && new_volume->velocity_scale > 0)
@@ -281,9 +274,23 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 			}
 
 			new_volume->total_bbox.expand(grid_bbox);
-
 			total_bbox.expand(world_grid_bbox);
 		}
+
+		new_volume->total_bbox.max().offset(1); // padding so the bbox of a node becomes (origin,origin + node_dim)
+
+		switch (new_volume->density_grid->getGridClass())
+		{
+		case openvdb::GRID_LEVEL_SET:
+			AiMsgError("Ray-marching through the level set is not supported!");
+			return false;
+			break;
+		default:
+			new_volume->volume_intersector = new FogVolumeRayIntersector(*new_volume->density_grid, new_volume->total_bbox);
+			break;
+		}
+
+		volume->auto_step_size = max_comp(new_volume->density_grid->voxelSize());		
 
 		volume->bbox.min.x = total_bbox.min().x();
 		volume->bbox.min.y = total_bbox.min().y();
