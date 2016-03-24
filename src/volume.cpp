@@ -220,7 +220,12 @@ bool volume_init(void* user_ptr, const char* data, const AtNode* node, AtVolumeD
 						new_volume->converted_velocity_grid->setTransform(new_volume->density_grid->transform().copy());
 						new_volume->velocity_grid = openvdb::gridConstPtrCast<openvdb::Vec3SGrid>(new_volume->converted_velocity_grid);
 						AiAddMemUsage(new_volume->converted_velocity_grid->memUsage(), memory_category);
-					}										
+					}
+					else if (!new_volume->converted_velocity_grid)
+					{
+						AiMsgError("OpenVDB: we've already initialized with velocity grids. Invalid specifications on velocity_grids?");
+						break;
+					}
 
 					if (grid_name.back() == 'X' || grid_name.back() == 'x')
 					{
